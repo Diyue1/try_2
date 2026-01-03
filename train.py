@@ -9,12 +9,13 @@ from tqdm import tqdm
 from sklearn.metrics import average_precision_score, accuracy_score
 import numpy as np
 import random
+import io  # 新增：用于JPEG压缩
 
 from model_rswa import AIGCDetector
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# 路径请保持不用变
+# 路径配置
 TRAIN_DIR = "/data/ziqiang/yjz/dataset/Benchmark/newTrain/train"
 VAL_DIR = "/data/ziqiang/yjz/dataset/Benchmark/newTrain/val"
 
@@ -24,11 +25,9 @@ ACCUM_STEPS = TARGET_BATCH_SIZE // PHYSICAL_BATCH_SIZE
 
 LR = 2e-4
 EPOCHS = 20
-NUM_WORKERS = 4  # 建议改为 4 提高加载速度，如果报错改回 0
+NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-# [新增] 自定义 JPEG 压缩增强（模拟网络传播图）
 class RandomJPEGCompression:
     def __init__(self, quality_min=60, quality_max=100, p=0.5):
         self.quality_min = quality_min
@@ -37,17 +36,17 @@ class RandomJPEGCompression:
 
     def __call__(self, img):
         if random.random() < self.p:
+            # 随机选择压缩质量
             quality = random.randint(self.quality_min, self.quality_max)
             img = img.convert('RGB')
-            # 在内存中压缩再读取
-            import io
+            # 在内存中进行压缩和解压
             buffer = io.BytesIO()
             img.save(buffer, "JPEG", quality=quality)
+            buffer.seek(0)
             return Image.open(buffer)
         return img
 
 
-# [修改] 增强的数据加载器
 class RecursiveBinaryDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -67,8 +66,12 @@ class RecursiveBinaryDataset(Dataset):
                         path = os.path.join(root, file)
                         self.samples.append((path, label))
 
-        # 随机打乱数据，防止按文件夹顺序读取
+        # 打乱数据，防止按文件夹顺序读取导致训练不稳
         random.shuffle(self.samples)
+
+        if len(self.samples) == 0:
+            raise RuntimeError(f"未找到数据！请检查路径结构。")
+        print(f"[Dataset] {root_dir}: {len(self.samples)} images loaded.")
 
     def __len__(self):
         return len(self.samples)
@@ -81,35 +84,46 @@ class RecursiveBinaryDataset(Dataset):
                 image = self.transform(image)
             return image, label
         except Exception as e:
-            # 遇到坏图返回全黑张量，不报错中断
+            print(f"Warning: Failed to load image {path}: {e}")
+            # 返回全黑图作为 fallback，防止训练中断
             fallback = torch.zeros((3, 256, 256))
             return fallback, label
 
 
 def train_model():
-    print(f"环境: {torch.cuda.get_device_name(0)}")
+    print(f"环境: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
 
-    # [重点修改] 强力数据增强：防止过拟合的核心
     train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        RandomJPEGCompression(quality_min=50, quality_max=95, p=0.5),  # 模拟压缩
-        transforms.RandomHorizontalFlip(p=0.5),  # 随机水平翻转
-        transforms.RandomRotation(degrees=15),  # 随机旋转
+        # 1. 随机裁剪：严禁使用 Resize，以保留高频伪影
+        transforms.RandomCrop((256, 256), pad_if_needed=True, padding_mode='reflect'),
+
+        # 2. 几何增强：翻转与旋转
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+
+        # 3. [补全缺口] 通用性增强：模拟网络传播和不同生成器的特征
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.2),  # 模拟模糊
+        RandomJPEGCompression(quality_min=50, quality_max=100, p=0.5),  # 模拟压缩
         transforms.ColorJitter(brightness=0.1, contrast=0.1),  # 颜色微扰
-        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),  # 随机模糊
+
+        # 4. 转张量与归一化
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # 验证集保持干净，只做 Resize 和 Normalize
     val_transform = transforms.Compose([
-        transforms.Resize((256, 256)),
+        # 验证时取图片中心 256x256，保证输入一致性且不破坏频率特征
+        transforms.CenterCrop((256, 256)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    train_ds = RecursiveBinaryDataset(TRAIN_DIR, transform=train_transform)
-    val_ds = RecursiveBinaryDataset(VAL_DIR, transform=val_transform)
+    try:
+        train_ds = RecursiveBinaryDataset(TRAIN_DIR, transform=train_transform)
+        val_ds = RecursiveBinaryDataset(VAL_DIR, transform=val_transform)
+    except Exception as e:
+        print(f"数据集错误: {e}")
+        return
 
     train_loader = DataLoader(train_ds, batch_size=PHYSICAL_BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
@@ -118,16 +132,16 @@ def train_model():
 
     model = AIGCDetector(num_classes=2, embed_dim=96).to(DEVICE)
 
-    # [修改] 加入 weight_decay (L2正则化)
+    # 加入 Weight Decay 防止过拟合
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)  # 调整学习率策略
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     criterion = nn.CrossEntropyLoss()
 
     use_amp = torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     best_acc = 0.0
-    print(f"开始训练... (增强版)")
+    print(f"开始训练... (Data Augmentation V2)")
 
     for epoch in range(EPOCHS):
         model.train()
@@ -139,19 +153,18 @@ def train_model():
         for i, (inputs, labels) in enumerate(pbar):
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
 
+            # 混合精度训练
             if use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs, recon_loss = model(inputs)
                     cls_loss = criterion(outputs, labels)
                     loss = (cls_loss + recon_loss) / ACCUM_STEPS
+
+                scaler.scale(loss).backward()
             else:
                 outputs, recon_loss = model(inputs)
                 cls_loss = criterion(outputs, labels)
                 loss = (cls_loss + recon_loss) / ACCUM_STEPS
-
-            if use_amp:
-                scaler.scale(loss).backward()
-            else:
                 loss.backward()
 
             if (i + 1) % ACCUM_STEPS == 0:
@@ -168,7 +181,7 @@ def train_model():
 
         scheduler.step()
 
-        # 验证部分
+        # 验证循环
         model.eval()
         all_targets = []
         all_probs = []
@@ -177,7 +190,7 @@ def train_model():
             for inputs, labels in val_loader:
                 inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
                 if use_amp:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         outputs, _ = model(inputs)
                 else:
                     outputs, _ = model(inputs)
@@ -190,13 +203,13 @@ def train_model():
         val_acc = accuracy_score(all_targets, all_preds) * 100
         val_ap = average_precision_score(all_targets, all_probs) * 100
 
-        print(
-            f"Epoch {epoch + 1} | Loss: {running_loss / len(train_loader):.4f} | Acc: {val_acc:.2f}% | AP: {val_ap:.2f}%")
+        avg_loss = running_loss / len(train_loader)
+        print(f"Epoch {epoch + 1} | Loss: {avg_loss:.4f} | Acc: {val_acc:.2f}% | AP: {val_ap:.2f}%")
 
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), "best_rswa_model_v2.pth")
-            print("模型已保存")
+            torch.save(model.state_dict(), "best_rswa_model_v3.pth")
+            print(f"模型已保存: best_rswa_model_v3.pth")
 
 
 if __name__ == "__main__":
