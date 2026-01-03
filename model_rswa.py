@@ -77,6 +77,8 @@ class GMLP(nn.Module):
         return self.net(x)
 
 
+# 将此代码块放入 model_rswa.py 中，替换原有的 RSWABlock 类
+
 class RSWABlock(nn.Module):
     def __init__(self, dim, window_size, num_heads=4, recon_weight=0.1):
         super().__init__()
@@ -98,6 +100,7 @@ class RSWABlock(nn.Module):
 
         self.gmlp = GMLP(dim, dim * 4)
 
+        # 重建头：尝试将融合后的特征还原回原始的 patch 特征
         self.recon_head = nn.Linear(dim, dim)
 
     def forward(self, x):
@@ -107,15 +110,21 @@ class RSWABlock(nn.Module):
         x_feat = self.preprocess(x)
         x_feat = self.norm(x_feat)
 
+        # Padding logic to fit windows
         pad_h = (self.ws - H % self.ws) % self.ws
         pad_w = (self.ws - W % self.ws) % self.ws
         x_feat = F.pad(x_feat, (0, pad_w, 0, pad_h))
 
+        # [Sliding Window 核心] 使用 unfold 提取滑动窗口
+        # patches shape: (B, C, nH, nW, ws, ws)
         patches = x_feat.unfold(2, self.ws, self.ws).unfold(3, self.ws, self.ws)
         nH, nW = patches.shape[2], patches.shape[3]
+
+        # 调整 shape 准备进 Attention: (B * nH * nW, ws*ws, C)
         patches = patches.contiguous().view(B, C, nH, nW, self.ws, self.ws)
         patches = patches.permute(0, 2, 3, 4, 5, 1).contiguous().view(-1, self.ws * self.ws, C)
 
+        # Attention 机制
         qkv = self.qkv(patches)
         q, k, v = qkv.chunk(3, dim=-1)
 
@@ -127,23 +136,28 @@ class RSWABlock(nn.Module):
         attn = attn.softmax(dim=-1)
         out_attn = (attn @ v).transpose(1, 2).reshape(patches.shape[0], patches.shape[1], C)
 
+        # gMLP 分支
         v_flat = v.transpose(1, 2).reshape(patches.shape[0], patches.shape[1], C)
         out_gmlp = self.gmlp(v_flat)
 
+        # 融合
         out_fused = out_attn * out_gmlp
         out_fused = self.proj(out_fused)
 
         recon_pred = self.recon_head(out_fused)
+
+        # 使用 L1 Loss 计算差异
         recon_loss = F.l1_loss(recon_pred, patches.detach()) * self.recon_weight
 
+        # 还原回图片尺寸
         out_fused = out_fused.view(B, nH, nW, self.ws, self.ws, C)
         out_fused = out_fused.permute(0, 5, 1, 3, 2, 4).contiguous().view(B, C, nH * self.ws, nW * self.ws)
 
         if pad_h > 0 or pad_w > 0:
             out_fused = out_fused[:, :, :H, :W]
 
+        # 返回特征和辅助损失
         return out_fused + shortcut, {'recon_loss': recon_loss}
-
 
 class ResNetClassifier(nn.Module):
     def __init__(self, in_channels, num_classes):
@@ -270,3 +284,4 @@ class AIGCDetector(nn.Module):
         logits = self.classifier(X_fused)
 
         return logits, aux_dwt['recon_loss'] + aux_fft['recon_loss']
+
