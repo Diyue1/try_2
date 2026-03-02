@@ -237,34 +237,39 @@ class ResNetClassifier(nn.Module):
 
 
 class AIGCDetector(nn.Module):
-    def __init__(self, lambda_fuse=0.4):
+    def __init__(self, num_classes=2, embed_dim=96, lambda_fuse=0.4):
         super().__init__()
-        self.lambda_fuse = lambda_fuse  # 论文最优值 0.4 [cite: 248]
+        self.lambda_fuse = lambda_fuse  # 论文最优值 0.4 [cite: 1314]
 
-        # DWT 分支
+        # --- DWT 分支 (Window Tiling Branch) ---
         self.tiling = WindowTiling()
-        self.dwt_block = RSWABlock(96, window_size=4)  # 论文设置 b=4 
+        self.dwt_proj = nn.Conv2d(3, embed_dim, 1)  # 输入投影
+        self.dwt_block = RSWABlock(embed_dim, window_size=4)  # 论文设置 b=4 [cite: 1272]
         self.restore = WindowRestore()
-        self.dwt_proj = nn.Conv2d(3, 96, 1)  # 映射到 embed_dim
+        self.idwt_proj = nn.Conv2d(embed_dim, 12, 1)  # [修正] 映射回 DWT 四子带维度
 
-        # FFT 分支
-        self.fft_block = RSWABlock(96, window_size=8)  # 论文设置 b=8 
-        self.fft_proj = nn.Conv2d(3, 96, 1)
-        self.fft_out_proj = nn.Conv2d(96, 3, 1)
-        self.norm_fft = LayerNorm2d(96)
+        # --- FFT 分支 (Phase Complement Branch) ---
+        self.fft_proj = nn.Conv2d(3, embed_dim, 1)
+        self.norm_fft = LayerNorm2d(embed_dim)
+        self.fft_block = RSWABlock(embed_dim, window_size=8)  # 论文设置 b=8 [cite: 1277]
+        self.fft_out_proj = nn.Conv2d(embed_dim, 3, 1)
+        self.scale_dot = ScaleDot(3) # 论文中提到的缩放 
 
-        self.classifier = ResNetClassifier(3, 2)  # 您代码中已有的分类器
+        self.classifier = ResNetClassifier(in_channels=3, num_classes=num_classes)
 
     def forward(self, x):
-        # 1. DWT Branch (Window Tiling Branch) [cite: 187]
+        # 1. DWT Branch (实现论文图3的窗口平铺处理) [cite: 1194, 1259]
         x_dwt = haar_dwt(x)  # (B, 12, H/2, W/2)
-        feat_dwt = self.dwt_proj(F.interpolate(x, scale_factor=0.5))  # 基础特征
-        # 接入平铺逻辑
-        x_tiled = self.tiling(x_dwt)  # (B, 3, H, W)
-        feat_tiled = self.dwt_block(self.dwt_proj(x_tiled))
-        img_dwt = haar_idwt(self.restore(feat_tiled))
+        x_tiled = self.tiling(x_dwt)  # (B, 3, H, W) 交错平铺
+        
+        feat_dwt = self.dwt_proj(x_tiled) # (B, 96, H, W)
+        feat_dwt = self.dwt_block(feat_dwt) 
+        
+        # 重建回空间域: 降维 -> 还原平铺 -> IDWT 
+        feat_bands = self.idwt_proj(self.restore(feat_dwt)) # (B, 12, H/2, W/2)
+        img_dwt = haar_idwt(feat_bands) # (B, 3, H, W)
 
-        # 2. FFT Branch (Phase Complement Branch) 
+        # 2. FFT Branch (Phase Part of FFT) [cite: 1275-1277]
         fft_x = torch.fft.fft2(x.float())
         amp, phase = torch.abs(fft_x), torch.angle(fft_x)
 
@@ -273,8 +278,11 @@ class AIGCDetector(nn.Module):
         feat_phase = self.fft_block(feat_phase)
 
         new_phase = self.fft_out_proj(feat_phase)
-        img_fft = torch.fft.ifft2(torch.polar(amp, new_phase)).real.to(x.dtype)
+        # 结合原始幅度 amp 进行逆变换 [cite: 1278]
+        img_fft = torch.fft.ifft2(torch.polar(amp, new_phase.float())).real.to(x.dtype)
+        img_fft = self.scale_dot(img_fft)
 
-        # 3. Dual Branch Fusion [cite: 215]
+        # 3. Dual Frequency Branch Fusion (公式 5) [cite: 1281]
         X_fused = (1 - self.lambda_fuse) * img_dwt + self.lambda_fuse * img_fft
+        
         return self.classifier(X_fused)
