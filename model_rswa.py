@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
 
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6):
@@ -15,6 +13,23 @@ class LayerNorm2d(nn.Module):
         x = x.permute(0, 3, 1, 2)
         return x
 
+class WindowTiling(nn.Module):
+    def forward(self, x_dwt):
+        B, C4, H_half, W_half = x_dwt.shape
+        C = C4 // 4
+        LL, LH, HL, HH = torch.split(x_dwt, C, dim=1)
+        combined = torch.stack([LL, LH, HL, HH], dim=2)
+        combined = combined.view(B, C, 2, 2, H_half, W_half)
+        combined = combined.permute(0, 1, 4, 2, 5, 3).contiguous()
+        return combined.view(B, C, H_half * 2, W_half * 2)
+
+class WindowRestore(nn.Module):
+    def forward(self, x_tiled):
+        B, C, H, W = x_tiled.shape
+        H_half, W_half = H // 2, W // 2
+        x = x_tiled.view(B, C, H_half, 2, W_half, 2)
+        x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+        return x.view(B, 4 * C, H_half, W_half)
 
 class ScaleDot(nn.Module):
     def __init__(self, dim):
@@ -80,84 +95,68 @@ class GMLP(nn.Module):
 # 将此代码块放入 model_rswa.py 中，替换原有的 RSWABlock 类
 
 class RSWABlock(nn.Module):
-    def __init__(self, dim, window_size, num_heads=4, recon_weight=0.1):
+    def __init__(self, dim, window_size, num_heads=4):
         super().__init__()
         self.dim = dim
         self.ws = window_size
-        self.recon_weight = recon_weight
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
 
+        # 论文提到的预处理: 1x1 conv + 3x3 depthwise conv [cite: 162]
         self.preprocess = nn.Sequential(
             nn.Conv2d(dim, dim, 1),
             nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         )
         self.norm = LayerNorm2d(dim)
 
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Conv2d(dim, dim, 1)  # 对应公式(3)中的外部 conv
 
-        self.gmlp = GMLP(dim, dim * 4)
-
-        # 重建头：尝试将融合后的特征还原回原始的 patch 特征
-        self.recon_head = nn.Linear(dim, dim)
+        # GMLP 分支 [cite: 160]
+        self.gmlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
 
     def forward(self, x):
         B, C, H, W = x.shape
         shortcut = x
 
-        x_feat = self.preprocess(x)
-        x_feat = self.norm(x_feat)
+        x = self.preprocess(x)
+        x = self.norm(x)
 
-        # Padding logic to fit windows
+        # 窗口切分
         pad_h = (self.ws - H % self.ws) % self.ws
         pad_w = (self.ws - W % self.ws) % self.ws
-        x_feat = F.pad(x_feat, (0, pad_w, 0, pad_h))
+        x = F.pad(x, (0, pad_w, 0, pad_h))
 
-        # [Sliding Window 核心] 使用 unfold 提取滑动窗口
-        # patches shape: (B, C, nH, nW, ws, ws)
-        patches = x_feat.unfold(2, self.ws, self.ws).unfold(3, self.ws, self.ws)
-        nH, nW = patches.shape[2], patches.shape[3]
+        pH, pW = x.shape[2], x.shape[3]
+        nH, nW = pH // self.ws, pW // self.ws
 
-        # 调整 shape 准备进 Attention: (B * nH * nW, ws*ws, C)
-        patches = patches.contiguous().view(B, C, nH, nW, self.ws, self.ws)
+        # 展平窗口进行计算
+        patches = x.unfold(2, self.ws, self.ws).unfold(3, self.ws, self.ws)
         patches = patches.permute(0, 2, 3, 4, 5, 1).contiguous().view(-1, self.ws * self.ws, C)
 
-        # Attention 机制
-        qkv = self.qkv(patches)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        q = q.view(patches.shape[0], patches.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(patches.shape[0], patches.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(patches.shape[0], patches.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
-
+        # LoAttention 分支 [cite: 166]
+        qkv = self.qkv(patches).view(-1, self.ws * self.ws, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        out_attn = (attn @ v).transpose(1, 2).reshape(patches.shape[0], patches.shape[1], C)
+        out_attn = (attn @ v).transpose(1, 2).reshape(-1, self.ws * self.ws, C)
 
-        # gMLP 分支
-        v_flat = v.transpose(1, 2).reshape(patches.shape[0], patches.shape[1], C)
-        out_gmlp = self.gmlp(v_flat)
+        # GMLP 分支 [cite: 175]
+        out_gmlp = self.gmlp(patches)
 
-        # 融合
+        # 融合逻辑对齐公式(3): Attention * GMLP
         out_fused = out_attn * out_gmlp
-        out_fused = self.proj(out_fused)
 
-        recon_pred = self.recon_head(out_fused)
+        # 还原空间维度
+        out = out_fused.view(B, nH, nW, self.ws, self.ws, C).permute(0, 5, 1, 3, 2, 4).contiguous().view(B, C, pH, pW)
+        if pad_h > 0 or pad_w > 0: out = out[:, :, :H, :W]
 
-        # 使用 L1 Loss 计算差异
-        recon_loss = F.l1_loss(recon_pred, patches.detach()) * self.recon_weight
-
-        # 还原回图片尺寸
-        out_fused = out_fused.view(B, nH, nW, self.ws, self.ws, C)
-        out_fused = out_fused.permute(0, 5, 1, 3, 2, 4).contiguous().view(B, C, nH * self.ws, nW * self.ws)
-
-        if pad_h > 0 or pad_w > 0:
-            out_fused = out_fused[:, :, :H, :W]
-
-        # 返回特征和辅助损失
-        return out_fused + shortcut, {'recon_loss': recon_loss}
+        return self.proj(out) + shortcut
 
 class ResNetClassifier(nn.Module):
     def __init__(self, in_channels, num_classes):
@@ -238,50 +237,44 @@ class ResNetClassifier(nn.Module):
 
 
 class AIGCDetector(nn.Module):
-    def __init__(self, num_classes=2, embed_dim=96):
+    def __init__(self, lambda_fuse=0.4):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.lambda_fuse = lambda_fuse  # 论文最优值 0.4 [cite: 248]
 
-        self.dwt_proj = nn.Conv2d(12, embed_dim, 1)
-        self.dwt_block = RSWABlock(embed_dim, window_size=4)
-        self.idwt_proj = nn.Conv2d(embed_dim, 12, 1)
+        # DWT 分支
+        self.tiling = WindowTiling()
+        self.dwt_block = RSWABlock(96, window_size=4)  # 论文设置 b=4 
+        self.restore = WindowRestore()
+        self.dwt_proj = nn.Conv2d(3, 96, 1)  # 映射到 embed_dim
 
-        self.fft_proj = nn.Conv2d(3, embed_dim, 1)
-        self.fft_block = RSWABlock(embed_dim, window_size=8)
-        self.ifft_proj = nn.Conv2d(embed_dim, 3, 1)
-        self.scale_dot = ScaleDot(3)
+        # FFT 分支
+        self.fft_block = RSWABlock(96, window_size=8)  # 论文设置 b=8 
+        self.fft_proj = nn.Conv2d(3, 96, 1)
+        self.fft_out_proj = nn.Conv2d(96, 3, 1)
+        self.norm_fft = LayerNorm2d(96)
 
-        self.lambda_fuse = 0.4
-
-        self.classifier = ResNetClassifier(in_channels=3, num_classes=num_classes)
+        self.classifier = ResNetClassifier(3, 2)  # 您代码中已有的分类器
 
     def forward(self, x):
-        x_dwt = haar_dwt(x)
-        feat_dwt = self.dwt_proj(x_dwt)
-        feat_dwt, aux_dwt = self.dwt_block(feat_dwt)
+        # 1. DWT Branch (Window Tiling Branch) [cite: 187]
+        x_dwt = haar_dwt(x)  # (B, 12, H/2, W/2)
+        feat_dwt = self.dwt_proj(F.interpolate(x, scale_factor=0.5))  # 基础特征
+        # 接入平铺逻辑
+        x_tiled = self.tiling(x_dwt)  # (B, 3, H, W)
+        feat_tiled = self.dwt_block(self.dwt_proj(x_tiled))
+        img_dwt = haar_idwt(self.restore(feat_tiled))
 
-        feat_dwt_back = self.idwt_proj(feat_dwt)
-        img_recon_dwt = haar_idwt(feat_dwt_back)
-        img_recon_dwt = F.interpolate(img_recon_dwt, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        # 2. FFT Branch (Phase Complement Branch) 
+        fft_x = torch.fft.fft2(x.float())
+        amp, phase = torch.abs(fft_x), torch.angle(fft_x)
 
-        x_float32 = x.float()
-        fft_x = torch.fft.fft2(x_float32)
-        amp = torch.abs(fft_x)
-        phase = torch.angle(fft_x)
+        feat_phase = self.fft_proj(phase)
+        feat_phase = self.norm_fft(feat_phase)
+        feat_phase = self.fft_block(feat_phase)
 
-        feat_fft = self.fft_proj(phase)
-        feat_fft, aux_fft = self.fft_block(feat_fft)
+        new_phase = self.fft_out_proj(feat_phase)
+        img_fft = torch.fft.ifft2(torch.polar(amp, new_phase)).real.to(x.dtype)
 
-        new_phase = self.ifft_proj(feat_fft)
-        new_phase_float32 = new_phase.float()
-        complex_spec = torch.polar(amp, new_phase_float32)
-        img_recon_fft = torch.fft.ifft2(complex_spec).real
-        img_recon_fft = img_recon_fft.to(x.dtype)
-        img_recon_fft = self.scale_dot(img_recon_fft)
-
-        X_fused = (1 - self.lambda_fuse) * img_recon_dwt + self.lambda_fuse * img_recon_fft
-
-        logits = self.classifier(X_fused)
-
-        return logits, aux_dwt['recon_loss'] + aux_fft['recon_loss']
-
+        # 3. Dual Branch Fusion [cite: 215]
+        X_fused = (1 - self.lambda_fuse) * img_dwt + self.lambda_fuse * img_fft
+        return self.classifier(X_fused)
