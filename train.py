@@ -25,8 +25,9 @@ ACCUM_STEPS = TARGET_BATCH_SIZE // PHYSICAL_BATCH_SIZE
 
 LR = 2e-4
 EPOCHS = 20
-NUM_WORKERS = 4
+NUM_WORKERS = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class RandomJPEGCompression:
     def __init__(self, quality_min=60, quality_max=100, p=0.5):
@@ -36,14 +37,14 @@ class RandomJPEGCompression:
 
     def __call__(self, img):
         if random.random() < self.p:
-            # 随机选择压缩质量
             quality = random.randint(self.quality_min, self.quality_max)
             img = img.convert('RGB')
-            # 在内存中进行压缩和解压
-            buffer = io.BytesIO()
-            img.save(buffer, "JPEG", quality=quality)
-            buffer.seek(0)
-            return Image.open(buffer)
+            with io.BytesIO() as buffer:  # 使用 with 上下文管理
+                img.save(buffer, "JPEG", quality=quality)
+                buffer.seek(0)
+                new_img = Image.open(buffer)
+                new_img.load()  # 强制加载像素数据
+                return new_img
         return img
 
 
@@ -52,19 +53,24 @@ class RecursiveBinaryDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
-        self.class_to_idx = {'0_real': 0, '1_fake': 1}
+        self.target_categories = ['car', 'cat', 'chair', 'horse']
 
         if not os.path.exists(root_dir):
             raise RuntimeError(f"路径不存在: {root_dir}")
 
         for root, dirs, files in os.walk(root_dir):
+            parts = root.split(os.sep)
+            category_found = any(cat in parts for cat in self.target_categories)
+
+            if not category_found:
+                continue
+
             folder_name = os.path.basename(root)
-            if folder_name in self.class_to_idx:
-                label = self.class_to_idx[folder_name]
+            if folder_name in ['0_real', '1_fake']:
+                label = 0 if folder_name == '0_real' else 1
                 for file in files:
-                    if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.webp')):
-                        path = os.path.join(root, file)
-                        self.samples.append((path, label))
+                    if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        self.samples.append((os.path.join(root, file), label))
 
         # 打乱数据，防止按文件夹顺序读取导致训练不稳
         random.shuffle(self.samples)
