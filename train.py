@@ -24,7 +24,7 @@ TARGET_BATCH_SIZE = 128
 ACCUM_STEPS = TARGET_BATCH_SIZE // PHYSICAL_BATCH_SIZE
 
 LR = 2e-4
-EPOCHS = 20
+EPOCHS = 90
 NUM_WORKERS = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -140,7 +140,7 @@ def train_model():
 
     # 加入 Weight Decay 防止过拟合
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.8)
     criterion = nn.CrossEntropyLoss()
 
     use_amp = torch.cuda.is_available()
@@ -220,3 +220,4 @@ def train_model():
 
 if __name__ == "__main__":
     train_model()
+
