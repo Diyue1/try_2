@@ -284,5 +284,5 @@ class AIGCDetector(nn.Module):
 
         # 3. Dual Frequency Branch Fusion (公式 5) [cite: 1281]
         X_fused = (1 - self.lambda_fuse) * img_dwt + self.lambda_fuse * img_fft
-        
-        return self.classifier(X_fused)
+        return self.classifier(X_fused), torch.tensor(0.0).to(x.device)
+
